@@ -3,47 +3,53 @@ import numpy as np
 
 if __name__ == '__main__':
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(2)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(0)
 
     from dream import Dreamer
 
-    rop_tensorflow_model = './rop_classification_model.pb'
-
-    # gan_dreamer = Dreamer(input_model=None,
+    # gan_dreamer = Dreamer(input_model=pages_model,
     #                         keras_model=rop_keras_model,
     #                         keras_weights=rop_keras_weights,
     #                         output_keras_conversion=rop_tensorflow_model,
-    #                         output_folder='./pages_convs_andrew',
+    #                         output_folder='./PAGES_model_vanilla_naive',
     #                         delete_output_folder=True,
-    #                         ops_types=['dis_n_conv_2_8/Conv2D'],
+    #                         ops_types=['dis_n_conv_1_4/Conv2D'],
     #                         channels=3,
     #                         image_size=1024,
-    #                         dream_mode='deepdream',
-    #                         specific_filters=[19],
-    #                         specific_layers=['dis_n_conv_2_8'],
-    #                         iterations=35,
-    #                         input_base_image='me.jpg',
-    #                         save_color=True)
+    #                         dream_mode='laplace',
+    #                         specific_layers=['dis_n_conv_1_4'],
+    #                         iterations=99,
+    #                         save_color=True,                          
+    #                         pad_level=2,
+    #                         multiscale=False,
+    #                         transforms=['jitter', 'jitter', 'pad'],
+    #                         regularization='laplace')
 
     gan_dreamer = Dreamer(input_model=None,
-                            keras_model=rop_keras_model,
-                            keras_weights=rop_keras_weights,
+                            keras_model=mobilenet_keras_model,
+                            keras_weights=mobilenet_keras_weights,
                             output_keras_conversion=rop_tensorflow_model,
-                            output_folder='./rop_classification_feature_vec',
+                            output_folder='./rop_mobilenet',
                             delete_output_folder=True,
-                            ops_types=['pool5/7x7_s2/AvgPool'],
+                            ops_types=['dense_1/Relu'],
                             ops_prefixes=[''],
-                            channels_last=False,
+                            channels_last=True,
                             input_tensor_name='input_1',
                             channels=3,
                             image_size=224,
                             dream_mode='laplace',
-                            specific_filters=None,
+                            specific_filters=[3,39,46,55,68,84,87],
                             specific_layers=None,
-                            iterations=50,
+                            iterations=199,
                             input_base_image=None,
-                            save_color=True)
+                            save_color=True,
+                            multiscale=False,
+                            transforms=['random_rotate', 'jitter', 'pad'],
+                            regularization_mode='laplace',
+                            optimize_step=1,
+                            tensorboard_output='./model_tensorboard')
 
     gan_dreamer.open_model()
-    # gan_dreamer.find_layers()
+    # gan_dreamer.get_weights(['dropout'])
+    # gan_dreamer.find_layers(contains=[''])
     gan_dreamer.dream_image()

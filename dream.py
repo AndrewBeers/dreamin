@@ -7,6 +7,8 @@ import tensorflow as tf
 import keras
 import json
 import shutil
+import sys
+import csv
 
 from keras import backend as K
 from PIL import Image
@@ -16,8 +18,11 @@ from util import add_parameter, save_image
 from collections import OrderedDict
 from scipy.misc import imresize
 from shutil import rmtree
+from transform import jitter, pad, random_scale, random_rotate
 
 from custom_layers import PoolHelper, LRN
+
+keras.backend.set_learning_phase(0)
 
 class Dreamer(object):
 
@@ -43,12 +48,22 @@ class Dreamer(object):
         add_parameter(self, kwargs, 'input_tensor_name', 'discriminator/discriminator_input')
         add_parameter(self, kwargs, 'ops_prefixes', ['discriminator/'])
         add_parameter(self, kwargs, 'ops_types', ['Conv2D'])
-
-        # Dream Parameters
         add_parameter(self, kwargs, 'specific_filters', None)
         add_parameter(self, kwargs, 'specific_layers', None)
+
+        # Dream Parameters
+        add_parameter(self, kwargs, 'transforms', ['jitter', 'pad'])
+        add_parameter(self, kwargs, 'pad_level', 2)
         add_parameter(self, kwargs, 'dream_mode', 'laplace')
+        add_parameter(self, kwargs, 'multiscale', True)
+        add_parameter(self, kwargs, 'octave_n', 3)
+        add_parameter(self, kwargs, 'octave_scale', 1.4)
+        add_parameter(self, kwargs, 'optimize_step', 1)
+        add_parameter(self, kwargs, 'regularization_mode', 'laplace')
         add_parameter(self, kwargs, 'iterations', 200)
+
+        # Laplace Parameters
+        add_parameter(self, kwargs, 'lap_n', 4)
 
         # Save Parameters
         add_parameter(self, kwargs, 'save_color', False)
@@ -59,19 +74,15 @@ class Dreamer(object):
 
     def build(self):
 
+        if not self.multiscale:
+            self.octave_n = 1
+
         self.laplace_kernel = np.float32([1,4,6,4,1])
         self.laplace_kernel = np.outer(self.laplace_kernel, self.laplace_kernel)
         self.laplace_kernel5x5 = self.laplace_kernel[:,:,None,None]/self.laplace_kernel.sum()*np.eye(self.channels, dtype=np.float32)
 
         # Should this be initialized as None? Coding etiquette..
         self.layer_dict = OrderedDict()
-
-        if self.delete_output_folder and os.path.exists(self.output_folder):
-            rmtree(self.output_folder)
-
-        for folder in [self.output_folder]:
-            if not os.path.exists(folder):
-                os.makedirs(folder)
 
         if self.input_base_image is not None:
             self.input_base_image = np.asarray(Image.open(self.input_base_image), dtype='uint8')
@@ -101,29 +112,45 @@ class Dreamer(object):
 
         for op in self.graph.get_operations():
             if op.name.endswith(tuple(self.ops_types)) and op.name.startswith(tuple(self.ops_prefixes)):
-                if self.channels_last:
-                    self.layer_dict[op.name] = {'tensor': op, 'feature_num': int(self.graph.get_tensor_by_name(op.name+':0').get_shape()[-1])}
-                else:
-                    self.layer_dict[op.name] = {'tensor': op, 'feature_num': int(self.graph.get_tensor_by_name(op.name+':0').get_shape()[-1])}
+                if self.graph.get_tensor_by_name(op.name + ':0').get_shape() != ():
+                    if self.channels_last:
+                        self.layer_dict[op.name] = {'tensor': op, 'feature_num': int(self.graph.get_tensor_by_name(op.name + ':0').get_shape()[-1])}
+                    else:
+                        self.layer_dict[op.name] = {'tensor': op, 'feature_num': int(self.graph.get_tensor_by_name(op.name + ':0').get_shape()[-1])}
+
         if True:
             for name in self.layer_dict:
                 print(name)
+
+        self.lap_norm_func = self.tffunc(np.float32)(partial(self.lap_normalize, scale_n=self.lap_n))
+
+        self.transform_dict = {'jitter': jitter(self.pad_level),
+                                'pad': pad(self.pad_level/2),
+                                'random_scale': random_scale([1 + (i-5)/50. for i in range(11)]),
+                                'random_rotate': random_rotate([0,90,180,270])}
+
+        self.transforms = [self.transform_dict[t] for t in self.transforms]
+
+        if self.transforms != []:
+            self.composed_transform = self.compose(self.transforms)
+        else:
+            self.composed_transform = None
 
     def load_keras_model(self):
 
         json_file = open(self.keras_model, 'r')
         loaded_model_json = json_file.read()
         json_file.close()
-        model = keras.models.model_from_json(loaded_model_json, custom_objects={'PoolHelper':PoolHelper, 'LRN':LRN})
-        model.load_weights(self.keras_weights)
 
-        # for name in self.graph.get_operations():
-        #     try:
-        #         print(name.name), print(self.graph.get_tensor_by_name(name.name+':0'))
-        #     except:
-        #         continue
+        model = keras.models.model_from_json(loaded_model_json, custom_objects={'PoolHelper': PoolHelper, 'LRN': LRN, 'relu6': keras.applications.mobilenet.relu6, 'DepthwiseConv2d': keras.applications.mobilenet.DepthwiseConv2D})
 
-        # fd = dg
+        # print(dir(model))
+        # for layer in model.layers:
+        #     print(layer)
+        # g
+
+        if self.keras_weights is not None:
+            model.load_weights(self.keras_weights)
 
         return
 
@@ -131,72 +158,175 @@ class Dreamer(object):
 
         for layer in self.graph.get_operations():
             if any(op_type in layer.name for op_type in contains):
-                print(layer.name)
+                try:
+                    if self.graph.get_tensor_by_name(layer.name+':0').get_shape() != ():
+                        print(layer.name, self.graph.get_tensor_by_name(layer.name+':0').get_shape())
+                except:
+                    continue
+
+    def get_weights(self, contains=['']):
+
+        for layer in self.graph.get_operations():
+            if any(op_type in layer.name for op_type in contains):
+                try:
+                    if self.graph.get_tensor_by_name(layer.name+':0').get_shape() != ():
+                        print(layer.name)
+                        print(self.graph.get_tensor_by_name(layer.name+':0'))
+                except:
+                    continue      
+
+    def save_weights(self, weights_name):
+
+        with open('weights.csv', 'wb') as writefile:
+            csvfile = csv.writer(writefile, delimiter=',')
+            for layer in self.graph.get_operations():
+                if layer.name == weights_name:
+                    weights_array = self.graph.get_tensor_by_name(layer.name+':0').eval()
+                    for row_idx, row in enumerate(weights_array):
+                        csvfile.writerow([row_idx] + row.tolist())
 
     def dream_image(self):
 
+        if self.delete_output_folder and os.path.exists(self.output_folder):
+            rmtree(self.output_folder)
+
+        for folder in [self.output_folder]:
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+
         self.input_tensor = self.graph.get_tensor_by_name(self.input_tensor_name + ':0')
+        print(self.input_tensor)
 
         print('Number of layers', len(self.layer_dict))
         # print('Total number of feature channels:', sum(feature_nums))
-        self.find_layers()
+        # self.find_layers()
 
         self.resize_func = self.tffunc(np.float32, np.int32)(self.resize)
 
         for layer_name in reversed(self.layer_dict.keys()):
-            activated_tensor = self.T(layer_name)
+            activated_tensor = self.grab_tensor(layer_name)
             print(layer_name, self.layer_dict[layer_name]['feature_num'])
-            for channel in range(self.layer_dict[layer_name]['feature_num']):
-            # for channel in [19]:
 
-                output_filename = os.path.join(self.output_folder, '_'.join([self.dream_mode, layer_name.replace('/', '_'), 'filter', str(channel)]) + '.png')
+            # Doesn't make too much sense on a layerwise basis.
+            if self.specific_filters is None:
+                filter_iter = range(self.layer_dict[layer_name]['feature_num'])
+            else:
+                filter_iter = self.specific_filters
+
+            for filter_num in filter_iter:
+
+                output_filename = os.path.join(self.output_folder, '_'.join([self.dream_mode, layer_name.replace('/', '_'), 'filter', str(filter_num)]) + '.png')
 
                 if os.path.exists(output_filename):
                     continue
 
                 if self.input_base_image is None:
-                    img_noise = np.random.uniform(size=(1, self.image_size, self.image_size, self.channels), low=-1, high=1)
+                    img_noise = np.random.uniform(size=(1, self.image_size, self.image_size, self.channels), low=-1, high=1).astype(np.float32)
                 else:
                     img_noise = self.input_base_image
 
-                print(activated_tensor.shape)
-                activated_filter = activated_tensor[..., channel]
-                print(activated_filter.shape)
+                print('Input Tensor Shape', activated_tensor.shape)
+                # activated_filter = activated_tensor[..., filter_num]
+                filter_list = [119, 106, 91]
+                tensor_list = []
+                for i in filter_list + [filter_num]:
+                    tensor_list += [activated_tensor[..., i]]
+                activated_filter = tf.stack(tensor_list, axis=-1)
 
-                if self.dream_mode == 'naive':
-                    self.render_naive(activated_filter, img_noise, output_filename=output_filename)
-                elif self.dream_mode == 'multiscale':
-                    self.render_multiscale(activated_filter, img_noise, output_filename=output_filename)
-                elif self.dream_mode == 'laplace':
-                    self.render_lapnorm(activated_filter, img_noise, output_filename=output_filename, iter_n=self.iterations)
-                elif self.dream_mode == 'deepdream':
-                    self.render_deepdream(activated_filter, img_noise, output_filename=output_filename, iter_n=self.iterations)
+                print('Input Filter Shape', activated_filter.shape)
 
-    def T(self, layer):
+                self.render(activated_filter, img_noise, output_filename=output_filename, iterations=self.iterations)
+
+    def render(self, optimization_tensor, input_img, output_filename='test.png', iterations=20):
+        t_score = tf.reduce_mean(optimization_tensor)  # defining the optimization objective
+        t_grad = tf.gradients(t_score, self.input_tensor)[0]  # behold the power of automatic differentiation!
+
+        img = input_img.copy()
+
+        img = self.image_optimize(img, iterations, t_grad)
+
+        if img is not None:
+            img = self.norm_visualize(img)
+            img = np.clip(img, -1, 1)
+            save_image(img, output_filename, color=self.save_color)
+
+    def image_optimize(self, img, iterations, t_grad):
+
+        renderable = True
+
+        for octave in range(self.octave_n):
+            if octave > 0:
+                hw = np.float32(img.shape[1:3]) * self.octave_scale
+                img = self.resize_func(img, np.int32(hw))
+            for i in range(iterations):
+                # img = self.lap_norm_func(img)
+                # opti_img = img
+                if i % 1 == 5 and self.composed_transform is not None:
+                    img = self.composed_transform(img).eval()
+                g = self.calc_gradient(img, t_grad, tile_size=self.image_size*2)
+                # normalizing the gradient, so the same step size should work
+                if np.sum(g) == 0:
+                    renderable = False
+                    break
+                # print(np.sum(g), 'before_reg')
+                g = self.regularize(g)
+                # print(np.sum(g), 'after_reg')
+                img += g*self.optimize_step
+                print('.', end=' ')
+                sys.stdout.flush()
+        print('\n')
+        if renderable:
+            return img
+        else:
+            return None
+
+    def calc_gradient(self, img, t_grad, tile_size=1024):
+
+        if self.multiscale:
+            sz = tile_size
+            h, w = img.shape[1:3]
+            sx, sy = np.random.randint(sz, size=2)
+            img_shift = np.roll(np.roll(img, sx, 2), sy, 1)
+            grad = np.zeros_like(img)
+            for y in range(0, max(h-sz//2, sz),sz):
+                for x in range(0, max(w-sz//2, sz),sz):
+                    sub = img_shift[:,y:y+sz/2,x:x+sz/2,:]
+                    if self.channels_last:
+                        g = self.sess.run(t_grad, {self.input_tensor:sub})
+                    else:
+                        sub = np.swapaxes(sub, 1, -1)
+                        g = self.sess.run(t_grad, {self.input_tensor:sub})
+                        g = np.swapaxes(g, 1, -1)
+                    grad[:,y:y+sz/2,x:x+sz/2,:] = g
+            return np.roll(np.roll(grad, -sx, 2), -sy, 1)
+
+        else:
+            if self.channels_last:
+                g = self.sess.run(t_grad, {self.input_tensor:img})
+            else:
+                img = np.swapaxes(img, 1, -1)
+                g = self.sess.run(t_grad, {self.input_tensor:img})
+                g = np.swapaxes(g, 1, -1)
+            return g
+
+    def regularize(self, g):
+
+        if self.regularization_mode == 'naive':
+            g /= g.std()+1e-8
+            return g
+
+        if self.regularization_mode == 'laplace':
+            return self.lap_norm_func(g)
+
+    def grab_tensor(self, layer):
         '''Helper for getting layer output tensor'''
         return self.graph.get_tensor_by_name(layer +':0')
 
-    def render_naive(self, t_obj, img0, output_filename='test.png', iter_n=20, step=1.0):
-        t_score = tf.reduce_mean(t_obj) # defining the optimization objective
-        t_grad = tf.gradients(t_score, self.input_tensor)[0] # behold the power of automatic differentiation!
-        
-        img = img0.copy()
-        print(img.shape)
-        print(self.input_tensor)
-        for i in range(iter_n):
-            print('iter', i)
-            g, score = self.sess.run([t_grad, t_score], {self.input_tensor:img})
-            # normalizing the gradient, so the same step size should work 
-            g /= g.std()+1e-8         # for different layers and networks
-            img += g*step
-            print(score, end = ' ')
-        # img = self.visstd(img)
-        img = self.visstd(img)
-        print(np.unique(img))
-        img = np.clip(img, -1, 1)
-        save_image(img, output_filename)
+    def transform_input_image(self, image):
 
-    def visstd(self, a, s=0.1):
+        return
+
+    def norm_visualize(self, a, s=0.1):
         '''Normalize the image range for visualization'''
         return (a-a.mean())/max(a.std(), 1e-4)*s + 0.5
 
@@ -216,56 +346,11 @@ class Dreamer(object):
     def resize(self, img, size):
         return tf.image.resize_bilinear(img, size)
 
-    def calc_grad_tiled(self, img, t_grad, tile_size=1024):
-        '''Compute the value of tensor t_grad over the image in a tiled way.
-        Random shifts are applied to the image to blur tile boundaries over 
-        multiple iterations.'''
-        sz = tile_size
-        h, w = img.shape[1:3]
-        print(h, w)
-        sx, sy = np.random.randint(sz, size=2)
-        img_shift = np.roll(np.roll(img, sx, 2), sy, 1)
-        grad = np.zeros_like(img)
-        for y in range(0, max(h-sz//2, sz),sz):
-            for x in range(0, max(w-sz//2, sz),sz):
-                print(h, w, x, y, sz)
-                sub = img_shift[:,y:y+sz/2,x:x+sz/2,:]
-                if self.channels_last:
-                    g = self.sess.run(t_grad, {self.input_tensor:sub})
-                else:
-                    sub = np.swapaxes(sub, 1, -1)
-                    g = self.sess.run(t_grad, {self.input_tensor:sub})
-                    g = np.swapaxes(g, 1, -1)
-                grad[:,y:y+sz/2,x:x+sz/2,:] = g
-        return np.roll(np.roll(grad, -sx, 2), -sy, 1)
-
-    def render_multiscale(self, t_obj, img0, output_filename='test.png', iter_n=10, step=1.0, octave_n=3, octave_scale=1.4):
-        t_score = tf.reduce_mean(t_obj) # defining the optimization objective
-        t_grad = tf.gradients(t_score, self.input_tensor)[0] # behold the power of automatic differentiation!
-        
-        img = img0.copy()
-        for octave in range(octave_n):
-            if octave>0:
-                hw = np.float32(img.shape[1:3])*octave_scale
-                print(hw)
-                img = self.resize_func(img, np.int32(hw))
-            for i in range(iter_n):
-                g = self.calc_grad_tiled(img, t_grad, tile_size=self.image_size*2)
-                # normalizing the gradient, so the same step size should work 
-                g /= g.std()+1e-8         # for different layers and networks
-                img += g*step
-                print('.', end = ' ')
-            print('octave', octave)
-        img = self.visstd(img)
-        print(np.unique(img))
-        img = np.clip(img, -1, 1)
-        save_image(img, output_filename)
-
     def lap_split(self, img):
         '''Split the image into lo and hi frequency components'''
         with tf.name_scope('split'):
-            lo = tf.nn.conv2d(img, self.laplace_kernel5x5, [1,2,2,1], 'SAME')
-            lo2 = tf.nn.conv2d_transpose(lo, self.laplace_kernel5x5*4, tf.shape(img), [1,2,2,1])
+            lo = tf.nn.conv2d(img, self.laplace_kernel5x5, [1, 2, 2, 1], 'SAME')
+            lo2 = tf.nn.conv2d_transpose(lo, self.laplace_kernel5x5 * 4, tf.shape(img), [1, 2, 2, 1])
             hi = img-lo2
         return lo, hi
 
@@ -299,61 +384,12 @@ class Dreamer(object):
         out = self.lap_merge(tlevels)
         return out
 
-    def render_lapnorm(self, t_obj, img0, output_filename='test.png', iter_n=40, step=1.0, octave_n=3, octave_scale=1.4, lap_n=4):
-        t_score = tf.reduce_mean(t_obj) # defining the optimization objective
-        t_grad = tf.gradients(t_score, self.input_tensor)[0] # behold the power of automatic differentiation!
-        # build the laplacian normalization graph
-        lap_norm_func = self.tffunc(np.float32)(partial(self.lap_normalize, scale_n=lap_n))
-
-        img = img0.copy()
-        for octave in range(octave_n):
-            if octave>0:
-                hw = np.float32(img.shape[1:3])*octave_scale
-                img = self.resize(img, np.int32(hw)).eval()
-            for i in range(iter_n):
-                g = self.calc_grad_tiled(img, t_grad, tile_size=self.image_size*2)
-                g = lap_norm_func(g)
-                img += g*step
-                print('.', end = ' ')
-        img = self.visstd(img)
-        print(np.unique(img))
-        img = np.clip(img, -1, 1)
-        save_image(img, output_filename, color=self.save_color)
-
-
-    def render_deepdream(self, t_obj, img0, output_filename='test.png', iter_n=35, step=.015, octave_n=1, octave_scale=1.2, lap_n=4):
-        t_score = tf.reduce_mean(t_obj) # defining the optimization objective
-        t_grad = tf.gradients(t_score, self.input_tensor)[0] # behold the power of automatic differentiation!
-
-        lap_norm_func = self.tffunc(np.float32)(partial(self.lap_normalize, scale_n=lap_n))
-
-        # split the image into a number of octaves
-        img = img0.copy()
-        octaves = []
-        for i in range(octave_n-1):
-            hw = img.shape[1:3]
-            print(hw)
-            new_hw = [np.float32(x)/octave_scale for x in hw]
-            lo = self.resize(img, np.int32(new_hw)).eval()
-            hi = img-self.resize(lo, hw).eval()
-            img = lo
-            octaves.append(hi)
-        
-        # generate details octave by octave
-        for octave in range(octave_n):
-            if octave > 0:
-                hi = octaves[-octave]
-                img = self.resize(img, hi.shape[1:3]).eval()+hi
-            for i in range(iter_n):
-                g = self.calc_grad_tiled(img, t_grad, tile_size=self.image_size*2)
-                g = lap_norm_func(g)
-                img += g*(step / (np.abs(g).mean()+1e-7))
-                print('.',end = ' ')
-        # img = self.visstd(img)
-        print(np.unique(img))
-        img = np.clip(img, -1, 1)
-        save_image(img, output_filename, color=self.save_color)
-
+    def compose(self, transforms):
+        def inner(x):
+            for transform in transforms:
+                x = transform(x)
+            return x
+        return inner
 
     def commented_code(self):
         # creating TensorFlow session and loading the model
@@ -372,6 +408,28 @@ class Dreamer(object):
         # with tf.gfile.FastGFile(os.path.join(self.input_model, 'saved_model.pb'), 'rb') as f:
             # graph_def = tf.GraphDef()
             # graph_def.ParseFromString(f.read())
+
+        # octaves = []
+        # for i in range(octave_n-1):
+        #     hw = img.shape[1:3]
+        #     print(hw)
+        #     new_hw = [np.float32(x)/octave_scale for x in hw]
+        #     lo = self.resize(img, np.int32(new_hw)).eval()
+        #     hi = img-self.resize(lo, hw).eval()
+        #     img = lo
+        #     octaves.append(hi)
+        
+        # # generate details octave by octave
+        # for octave in range(octave_n):
+        #     if octave > 0:
+        #         hi = octaves[-octave]
+        #         img = self.resize(img, hi.shape[1:3]).eval()+hi
+        #     for i in range(iterations):
+        #         g = self.calc_grad_tiled(img, t_grad, tile_size=self.image_size*2)
+        #         g = lap_norm_func(g)
+        #         img += g*(step / (np.abs(g).mean()+1e-7))
+        #         print('.',end = ' ')
+
 
         return
 
@@ -425,6 +483,10 @@ def show_graph(graph_def, max_const_size=32):
         <iframe seamless style="width:800px;height:620px;border:0" srcdoc="{}"></iframe>
     """.format(code.replace('"', '&quot;'))
     display(HTML(iframe))
+
+def select(lst, *indices):
+    return (lst[i] for i in indices)
+
 
 # Visualizing the network graph. Be sure expand the "mixed" nodes to see their 
 # internal structure. We are going to visualize "Conv2D" nodes.

@@ -6,6 +6,7 @@ __pycache__/
 *.bmp
 *.jpg
 *.pb
+*.csv
 
 # C extensions
 *.so
